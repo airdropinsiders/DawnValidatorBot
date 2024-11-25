@@ -30,7 +30,7 @@
 ## How To Use
 1.  Clone Repo
     ```
-    git clone https://github.com/vinskasenda/DawnValidatorBot.git
+    git clone https://github.com/airdropinsiders/DawnValidatorBot.git
     ```
 2.  Move to Directory
     ```
