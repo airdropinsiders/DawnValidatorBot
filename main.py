@@ -14,6 +14,9 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 from asyncio import Queue
 import itertools
+import argparse
+import multiprocessing
+from multiprocessing import Pool, Manager 
 
 banner = """
 ==================================================================
@@ -41,6 +44,10 @@ time.sleep(1)
 
 CONFIG_FILE = "config.json"
 PROXY_FILE = "proxies.txt"
+
+parser = argparse.ArgumentParser(description='DAWN AUTO BOT - Airdrop Insider')
+parser.add_argument('-W', '-w', '--worker', type=int, default=3, help='Number of worker threads')
+args = parser.parse_args()
 
 # Setup logging with color
 log_colors = {
@@ -114,17 +121,14 @@ def parse_proxy(proxy):
     return {}
 
 def check_proxy(proxy):
-    """Check if the proxy is active by sending a request to a test URL."""
+    """Check if the proxy is active without logging."""
     proxies = parse_proxy(proxy)
-    test_url = "http://httpbin.org/ip"  # You can change this URL to any service that returns IP
+    test_url = "http://httpbin.org/ip"
     try:
         response = requests.get(test_url, proxies=proxies, timeout=5)
-        if response.status_code == 200:
-            logging.success(f"Proxy {proxy} is active.")
-            return True
+        return response.status_code == 200
     except requests.RequestException:
-        logging.error(f"Proxy {proxy} is inactive.")
-    return False
+        return False
 
 def get_active_proxies():
     """Check all proxies and return a list of active proxies using multithreading."""
@@ -132,7 +136,7 @@ def get_active_proxies():
     active_proxies = []
 
     # Create a ThreadPoolExecutor to run proxy checks concurrently
-    with ThreadPoolExecutor(max_workers=20) as executor:  # You can adjust max_workers to control the level of concurrency
+    with ThreadPoolExecutor(max_workers=200) as executor:  # You can adjust max_workers to control the level of concurrency
         futures = [executor.submit(check_proxy, proxy) for proxy in proxies]
         
         # Collect results as they complete
@@ -265,70 +269,96 @@ async def telegram_message(message):
         except Exception as e:
             logging.error(f"Error sending Telegram message: {e}")
 
-async def process_account(account, proxy_cycle, active_proxies):
+def process_account(account, proxy_list, active_proxies):
     email = account["email"]
     token = account["token"]
-    headers = { 
+    headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "User-Agent": ua.random
     }
 
-    all_failed = True  # Track if all proxies fail
-
-    # Kita iterasi berdasarkan jumlah proxy yang ada dalam daftar active_proxies
-    for _ in range(len(active_proxies)):
-        proxy = next(proxy_cycle)
-        session = create_session(proxy)
-
-        success, status_message = keep_alive(headers, email, session)
-
-        if success:
-            points = total_points(headers, session)
-            message = (
-                "✅ *🌟 Success Notification 🌟* ✅\n\n"
-                f"👤 *Account:* {email}\n\n"
-                f"💰 *Points Earned:* {points}\n\n"
-                f"📢 *Message:* {status_message}\n\n"
-                f"🛠️ *Proxy Used:* {proxy}"  # Menambahkan proxy yang digunakan
-                "\n\n🤖 *Bot made by https://t.me/AirdropInsiderID*"  # Tautan yang dapat diklik
-            )
-            await queue_telegram_message(message)
-            all_failed = False
-            break  # If success, break out of proxy loop to continue with next account
-        else:
-            logging.error(f"Failed keep alive for {email} with proxy {proxy}. Reason: {status_message}")
+    session = None  # Inisialisasi session di luar loop
     
-    if all_failed:
+    try:
+        for proxy in proxy_list:
+            if session:
+                session.close()  # Tutup session sebelumnya jika ada
+            session = create_session(proxy)
+
+            success, status_message = keep_alive(headers, email, session)
+
+            if success:
+                points = total_points(headers, session)
+                message = (
+                    "✅ *🌟 Success Notification 🌟* ✅\n\n"
+                    f"👤 *Account:* {email}\n\n"
+                    f"💰 *Points Earned:* {points}\n\n"
+                    f"📢 *Message:* {status_message}\n\n"
+                    f"🛠️ *Proxy Used:* {proxy}\n\n"
+                    "🤖 *Bot made by https://t.me/AirdropInsiderID*"
+                )
+                logging.success(f"Success keep alive for {email} with proxy {proxy}. Reason: {status_message}")
+                return email, True, message
+            else:
+                logging.error(f"Failed keep alive for {email} with proxy {proxy}. Reason: {status_message}")
+        
+        # Jika semua proxy gagal
         message = (
             "⚠️ *Failure Notification* ⚠️\n\n"
             f"👤 *Account:* {email}\n\n"
             "❌ *Status:* Keep Alive Failed for All Proxies\n\n"
             "⚙️ *Action Required:* Please check proxy list or account status.\n\n"
-            "\n\n🤖 *Bot made by <a href='https://t.me/AirdropInsiderID'>Airdrop Insider ID</a>*"  
+            "🤖 *Bot made by https://t.me/AirdropInsiderID*"
         )
-        await queue_telegram_message(message)
+        return email, False, message
+    finally:
+        if session:
+            session.close()  # Pastikan session ditutup
 
 async def main():
     accounts = read_account()
     active_proxies = get_active_proxies()
     update_proxies_file(active_proxies)
-    
-    # Create an infinite cycle of proxies
-    proxy_cycle = itertools.cycle(active_proxies)
 
     # Start the Telegram message worker
-    asyncio.create_task(telegram_worker())
+    telegram_task = asyncio.create_task(telegram_worker())
 
-    # Keep script running indefinitely until user stops
     while True:
-        for account in accounts:
-            await process_account(account, proxy_cycle, active_proxies)  # Pass active_proxies as argument
-        logging.info(f"Waiting {poll_interval} seconds before next cycle.")
-        await asyncio.sleep(poll_interval)
+        pool = None
+        try:
+            # Buat pool untuk memproses akun secara parallel
+            pool = Pool(processes=args.worker)
+            
+            # Siapkan parameter untuk setiap akun
+            process_params = [(account, active_proxies, active_proxies) for account in accounts]
+            
+            # Proses akun secara parallel
+            results = pool.starmap(process_account, process_params)
+
+            # Kirim pesan Telegram untuk setiap hasil
+            for email, success, message in results:
+                await queue_telegram_message(message)
+                logging.info(f"Account {email} completed with status: {'success' if success else 'failed'}")
+
+            logging.info(f"All accounts processed. Waiting {poll_interval} seconds before next cycle.")
+            await asyncio.sleep(poll_interval)
+
+        except Exception as e:
+            logging.error(f"Error in main loop: {e}")
+            await asyncio.sleep(10)
+        finally:
+            if pool:
+                pool.close()
+                pool.join()
 
 if __name__ == "__main__":
     try:
+        multiprocessing.freeze_support()
         asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("Script stopped by user.")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+    finally:
+        logging.info("Cleaning up resources...")

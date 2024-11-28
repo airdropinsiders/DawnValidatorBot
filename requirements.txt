@@ -1,6 +1,7 @@
 requests
-colorlog
-fake-useragent
 python-telegram-bot
-urllib3
+colorlog
+colorama
+fake-useragent
 pysocks
+urllib3
